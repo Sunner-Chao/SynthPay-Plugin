@@ -1,0 +1,22 @@
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local watcher state and diagnostics
+state/
+*.sqlite
+*.sqlite3
+*.log
+capture-*.png
+debug-*.png
+
+# Local callback configuration and credentials
+.env
+*.pem
+*.key
+wechat-watcher.ini
+
+# Repository-management helpers are local-only
+git_shell/
