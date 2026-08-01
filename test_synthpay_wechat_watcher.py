@@ -26,11 +26,12 @@ from synthpay_wechat_watcher import (  # noqa: E402
 class WindowsWatcherUnitTest(unittest.TestCase):
     def test_personal_receipt(self) -> None:
         raw = "个人收款服务 收款到账通知08月01日 12:30收款金额￥0.01汇总今日第1笔收款备注"
-        receipt = parse_receipt("微信收款助手", raw, datetime(2026, 8, 1, 12, 31, 0))
+        captured_at = datetime(2026, 8, 1, 12, 31, 45)
+        receipt = parse_receipt("微信收款助手", raw, captured_at)
         self.assertIsNotNone(receipt)
         self.assertEqual(receipt["channel"], "1")
         self.assertEqual(receipt["amount_cents"], 1)
-        self.assertEqual(receipt["observed_at"], 1785558600000)
+        self.assertEqual(receipt["observed_at"], int(captured_at.timestamp() * 1000))
 
     def test_merchant_receipt(self) -> None:
         raw = "收款通知08月01日 12:30:45收款金额：￥12.34订单金额￥12.34交易单号420001收款门店测试"
@@ -38,16 +39,18 @@ class WindowsWatcherUnitTest(unittest.TestCase):
         self.assertIsNotNone(receipt)
         self.assertEqual(receipt["channel"], "4")
         self.assertEqual(receipt["amount_cents"], 1234)
+        self.assertEqual(receipt["observed_at"], int(datetime(2026, 8, 1, 12, 30, 45).timestamp() * 1000))
 
     def test_unrelated_message_is_ignored(self) -> None:
         self.assertIsNone(parse_receipt("微信收款助手", "欢迎使用微信收款助手"))
 
     def test_ocr_text_can_include_window_chrome(self) -> None:
         raw = "微信支付 聊天信息 个人收款服务 收款到账通知08月01日 12:30收款金额￥0.01"
-        receipt = parse_receipt("微信收款助手", raw, datetime(2026, 8, 1, 12, 31, 0))
+        captured_at = datetime(2026, 8, 1, 12, 31, 45)
+        receipt = parse_receipt("微信收款助手", raw, captured_at)
         self.assertIsNotNone(receipt)
         self.assertEqual(receipt["amount_cents"], 1)
-        self.assertEqual(receipt["observed_at"], 1785558600000)
+        self.assertEqual(receipt["observed_at"], int(captured_at.timestamp() * 1000))
 
     def test_money_conversion(self) -> None:
         self.assertEqual(money_to_cents("10"), 1000)

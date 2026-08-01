@@ -86,7 +86,7 @@ def money_to_cents(value: str) -> int:
 
 def parse_observed_at(value: str, now: datetime | None = None) -> datetime:
     now = now or datetime.now()
-    for pattern in ("%Y-%m-%d%H:%M:%S", "%m月%d日%H:%M:%S", "%m月%d日%H:%M"):
+    for pattern in ("%Y-%m-%d%H:%M:%S", "%m月%d日%H:%M:%S"):
         try:
             parsed = datetime.strptime(value, pattern)
             if "%Y" not in pattern:
@@ -94,6 +94,12 @@ def parse_observed_at(value: str, now: datetime | None = None) -> datetime:
             return parsed
         except ValueError:
             continue
+
+    # WeChat personal-receipt notifications only display a minute.  Treating
+    # that minute as :00 can place the receipt before the payment order was
+    # created, so use the actual capture time when seconds are unavailable.
+    if re.fullmatch(r"\d{2}月\d{2}日\d{2}:\d{2}", value):
+        return now
     return now
 
 
