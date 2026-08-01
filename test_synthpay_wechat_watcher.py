@@ -69,6 +69,19 @@ class WindowsWatcherUnitTest(unittest.TestCase):
         candidates = (WindowCandidate(handle=1, width=160, height=28),)
         self.assertIsNone(select_capture_window(candidates))
 
+    def test_window_selection_uses_minimized_restore_size(self) -> None:
+        candidates = (
+            WindowCandidate(
+                handle=1,
+                width=160,
+                height=28,
+                minimized=True,
+                restore_width=614,
+                restore_height=648,
+            ),
+        )
+        self.assertEqual(select_capture_window(candidates), 1)
+
     def test_event_id_is_stable(self) -> None:
         receipt = {
             "channel": "1",

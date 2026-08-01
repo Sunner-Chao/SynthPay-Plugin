@@ -399,15 +399,48 @@ class Rect(ctypes.Structure):
     ]
 
 
+class Point(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int32),
+        ("y", ctypes.c_int32),
+    ]
+
+
+class WindowPlacement(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("show_cmd", ctypes.c_uint32),
+        ("min_position", Point),
+        ("max_position", Point),
+        ("normal_position", Rect),
+    ]
+
+
 @dataclass(frozen=True)
 class WindowCandidate:
     handle: int
     width: int
     height: int
+    minimized: bool = False
+    restore_width: int = 0
+    restore_height: int = 0
 
     @property
     def area(self) -> int:
-        return self.width * self.height
+        width = self.restore_width if self.minimized else self.width
+        height = self.restore_height if self.minimized else self.height
+        return width * height
+
+    @property
+    def capture_size(self) -> tuple[int, int]:
+        if self.minimized:
+            return self.restore_width, self.restore_height
+        return self.width, self.height
+
+
+def is_capture_size_valid(width: int, height: int) -> bool:
+    return 100 <= width <= 4096 and 100 <= height <= 4096
 
 
 def select_capture_window(candidates: Iterable[WindowCandidate]) -> int | None:
@@ -417,11 +450,7 @@ def select_capture_window(candidates: Iterable[WindowCandidate]) -> int | None:
     same title as a chat.  Those windows cannot contain receipt content and
     should not prevent the UI Automation observer from being used instead.
     """
-    usable = [
-        candidate
-        for candidate in candidates
-        if 100 <= candidate.width <= 4096 and 100 <= candidate.height <= 4096
-    ]
+    usable = [candidate for candidate in candidates if is_capture_size_valid(*candidate.capture_size)]
     return max(usable, key=lambda candidate: candidate.area).handle if usable else None
 
 
@@ -445,6 +474,8 @@ class WeChatOcrObserver:
         for window_title in self.settings.windows:
             handle = self.find_window(window_title)
             if handle is None:
+                continue
+            if not self.prepare_window_for_capture(handle):
                 continue
             if self.attached_handles.get(window_title) != handle:
                 if self.settings.background_window:
@@ -479,6 +510,36 @@ class WeChatOcrObserver:
         ):
             raise RuntimeError("SetWindowPos failed")
 
+    def get_window_placement(self, handle: int) -> WindowPlacement | None:
+        placement = WindowPlacement()
+        placement.length = ctypes.sizeof(WindowPlacement)
+        if not self.user32.GetWindowPlacement(handle, ctypes.byref(placement)):
+            return None
+        return placement
+
+    def prepare_window_for_capture(self, handle: int) -> bool:
+        if not self.user32.IsIconic(handle):
+            return True
+        placement = self.get_window_placement(handle)
+        if placement is None:
+            return False
+        normal = placement.normal_position
+        width = normal.right - normal.left
+        height = normal.bottom - normal.top
+        if not is_capture_size_valid(width, height):
+            return False
+        if self.settings.background_window:
+            normal.left = self.settings.background_x
+            normal.top = self.settings.background_y
+            normal.right = normal.left + width
+            normal.bottom = normal.top + height
+        placement.flags = 0
+        placement.show_cmd = 4  # SW_SHOWNOACTIVATE
+        if not self.user32.SetWindowPlacement(handle, ctypes.byref(placement)):
+            return False
+        logging.info("restored minimized WeChat window handle=%s size=%dx%d", handle, width, height)
+        return False
+
     def find_window(self, expected_title: str) -> int | None:
         matches: list[WindowCandidate] = []
         callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
@@ -503,11 +564,23 @@ class WeChatOcrObserver:
                 rect = Rect()
                 if not self.user32.GetWindowRect(handle, ctypes.byref(rect)):
                     return 1
+                minimized = bool(self.user32.IsIconic(handle))
+                restore_width = 0
+                restore_height = 0
+                if minimized:
+                    placement = self.get_window_placement(handle)
+                    if placement is not None:
+                        normal = placement.normal_position
+                        restore_width = normal.right - normal.left
+                        restore_height = normal.bottom - normal.top
                 matches.append(
                     WindowCandidate(
                         handle=int(handle),
                         width=rect.right - rect.left,
                         height=rect.bottom - rect.top,
+                        minimized=minimized,
+                        restore_width=restore_width,
+                        restore_height=restore_height,
                     )
                 )
             return 1
@@ -536,7 +609,7 @@ class WeChatOcrObserver:
             raise RuntimeError("GetWindowRect failed")
         width = rect.right - rect.left
         height = rect.bottom - rect.top
-        if width < 100 or height < 100 or width > 4096 or height > 4096:
+        if not is_capture_size_valid(width, height):
             raise RuntimeError(f"invalid WeChat window size {width}x{height}")
         window_dc = self.user32.GetWindowDC(handle)
         memory_dc = self.gdi32.CreateCompatibleDC(window_dc)
