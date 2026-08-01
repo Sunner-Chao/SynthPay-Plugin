@@ -393,11 +393,37 @@ class Rect(ctypes.Structure):
     ]
 
 
+@dataclass(frozen=True)
+class WindowCandidate:
+    handle: int
+    width: int
+    height: int
+
+    @property
+    def area(self) -> int:
+        return self.width * self.height
+
+
+def select_capture_window(candidates: Iterable[WindowCandidate]) -> int | None:
+    """Choose the largest usable WeChat conversation window.
+
+    WeChat can expose a small Qt title-bar or notification window with the
+    same title as a chat.  Those windows cannot contain receipt content and
+    should not prevent the UI Automation observer from being used instead.
+    """
+    usable = [
+        candidate
+        for candidate in candidates
+        if 100 <= candidate.width <= 4096 and 100 <= candidate.height <= 4096
+    ]
+    return max(usable, key=lambda candidate: candidate.area).handle if usable else None
+
+
 class WeChatOcrObserver:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.last_capture_digest: dict[str, str] = {}
-        self.attached_titles: set[str] = set()
+        self.attached_handles: dict[str, int] = {}
         self.rapid_ocr: Any | None = None
         self.rapid_ocr_failed = False
         self.available = os.name == "nt" and settings.tesseract_path.is_file() and settings.tessdata_dir.is_dir()
@@ -414,11 +440,12 @@ class WeChatOcrObserver:
             handle = self.find_window(window_title)
             if handle is None:
                 continue
-            if window_title not in self.attached_titles:
+            if self.attached_handles.get(window_title) != handle:
                 if self.settings.background_window:
                     self.move_to_background(handle)
-                logging.info("OCR observer attached window=%s", window_title)
-                self.attached_titles.add(window_title)
+                logging.info("OCR observer attached window=%s handle=%s", window_title, handle)
+                self.attached_handles[window_title] = handle
+                self.last_capture_digest.pop(window_title, None)
             image = self.capture_bmp(handle)
             digest = hashlib.sha256(image).hexdigest()
             if self.last_capture_digest.get(window_title) == digest:
@@ -447,7 +474,7 @@ class WeChatOcrObserver:
             raise RuntimeError("SetWindowPos failed")
 
     def find_window(self, expected_title: str) -> int | None:
-        matches: list[int] = []
+        matches: list[WindowCandidate] = []
         callback_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
 
         def inspect(handle: int, _parameter: int) -> int:
@@ -467,12 +494,21 @@ class WeChatOcrObserver:
             process_id = ctypes.c_uint32()
             self.user32.GetWindowThreadProcessId(handle, ctypes.byref(process_id))
             if self.process_name(process_id.value) == OCR_WECHAT_PROCESS_NAME:
-                matches.append(int(handle))
+                rect = Rect()
+                if not self.user32.GetWindowRect(handle, ctypes.byref(rect)):
+                    return 1
+                matches.append(
+                    WindowCandidate(
+                        handle=int(handle),
+                        width=rect.right - rect.left,
+                        height=rect.bottom - rect.top,
+                    )
+                )
             return 1
 
         callback = callback_type(inspect)
         self.user32.EnumWindows(callback, 0)
-        return matches[0] if matches else None
+        return select_capture_window(matches)
 
     def process_name(self, process_id: int) -> str:
         process_query_limited_information = 0x1000

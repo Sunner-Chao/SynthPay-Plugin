@@ -18,6 +18,8 @@ from synthpay_wechat_watcher import (  # noqa: E402
     parse_receipt,
     Settings,
     sign_payload,
+    WindowCandidate,
+    select_capture_window,
 )
 
 
@@ -51,6 +53,18 @@ class WindowsWatcherUnitTest(unittest.TestCase):
         self.assertEqual(money_to_cents("10"), 1000)
         self.assertEqual(money_to_cents("10.1"), 1010)
         self.assertEqual(money_to_cents("10.01"), 1001)
+
+    def test_window_selection_ignores_compact_chrome(self) -> None:
+        candidates = (
+            WindowCandidate(handle=1, width=160, height=28),
+            WindowCandidate(handle=2, width=760, height=540),
+            WindowCandidate(handle=3, width=640, height=480),
+        )
+        self.assertEqual(select_capture_window(candidates), 2)
+
+    def test_window_selection_returns_none_without_capture_area(self) -> None:
+        candidates = (WindowCandidate(handle=1, width=160, height=28),)
+        self.assertIsNone(select_capture_window(candidates))
 
     def test_event_id_is_stable(self) -> None:
         receipt = {
