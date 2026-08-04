@@ -104,7 +104,9 @@ def parse_observed_at(value: str, now: datetime | None = None) -> datetime:
 
 
 def parse_receipt(window_title: str, raw_text: str, now: datetime | None = None) -> dict[str, Any] | None:
+    captured_at = now or datetime.now()
     normalized = "".join(str(raw_text).split())
+    raw_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     for pattern in RECEIPT_PATTERNS:
         if window_title not in pattern["titles"] or pattern["message"].search(normalized) is None:
             continue
@@ -112,18 +114,30 @@ def parse_receipt(window_title: str, raw_text: str, now: datetime | None = None)
         if money_match is None:
             continue
         time_match = pattern["time"].search(normalized)
-        observed = parse_observed_at(time_match.group(1), now) if time_match else (now or datetime.now())
+        source_time = time_match.group(1) if time_match else ""
+        observed = parse_observed_at(source_time, captured_at) if source_time else captured_at
+        source_identity = source_time or raw_digest
+        if source_time and not source_time.startswith(str(captured_at.year)):
+            source_identity = f"{captured_at.year}:{source_time}"
+        receipt_identity = hashlib.sha256(
+            "\n".join((window_title, str(pattern["channel"]), money_match.group(1), source_identity)).encode("utf-8")
+        ).hexdigest()
         return {
             "channel": str(pattern["channel"]),
             "money": money_match.group(1),
             "amount_cents": money_to_cents(money_match.group(1)),
             "observed_at": int(observed.timestamp() * 1000),
-            "raw_digest": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+            "raw_digest": raw_digest,
+            "receipt_identity": receipt_identity,
         }
     return None
 
 
 def make_event_id(window_title: str, receipt: dict[str, Any]) -> str:
+    receipt_identity = receipt.get("receipt_identity")
+    if receipt_identity:
+        source = "\n".join((window_title, str(receipt["channel"]), str(receipt_identity)))
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()
     source = "\n".join(
         (
             window_title,
@@ -459,6 +473,11 @@ class WeChatOcrObserver:
         self.settings = settings
         self.last_capture_digest: dict[str, str] = {}
         self.attached_handles: dict[str, int] = {}
+        self.capture_warmup_until: dict[str, float] = {}
+        self.capture_armed: set[str] = set()
+        self.last_receipt_identity: dict[str, str] = {}
+        self.restore_retry_at: dict[int, float] = {}
+        self.restore_logged_handles: set[int] = set()
         self.rapid_ocr: Any | None = None
         self.rapid_ocr_failed = False
         self.available = os.name == "nt" and settings.tesseract_path.is_file() and settings.tessdata_dir.is_dir()
@@ -474,6 +493,10 @@ class WeChatOcrObserver:
         for window_title in self.settings.windows:
             handle = self.find_window(window_title)
             if handle is None:
+                self.attached_handles.pop(window_title, None)
+                self.last_capture_digest.pop(window_title, None)
+                self.capture_warmup_until.pop(window_title, None)
+                self.capture_armed.discard(window_title)
                 continue
             if not self.prepare_window_for_capture(handle):
                 continue
@@ -483,13 +506,32 @@ class WeChatOcrObserver:
                 logging.info("OCR observer attached window=%s handle=%s", window_title, handle)
                 self.attached_handles[window_title] = handle
                 self.last_capture_digest.pop(window_title, None)
+                self.capture_armed.discard(window_title)
+                self.capture_warmup_until[window_title] = time.monotonic() + max(4.0, self.settings.poll_interval * 2)
             image = self.capture_bmp(handle)
             digest = hashlib.sha256(image).hexdigest()
-            if self.last_capture_digest.get(window_title) == digest:
-                continue
+            previous_digest = self.last_capture_digest.get(window_title)
             self.last_capture_digest[window_title] = digest
+            if window_title not in self.capture_armed:
+                if time.monotonic() < self.capture_warmup_until.get(window_title, 0):
+                    continue
+                raw = self.read_text(window_title, image)
+                receipt = parse_receipt(window_title, raw) if raw else None
+                if receipt is not None:
+                    self.last_receipt_identity[window_title] = str(receipt["receipt_identity"])
+                self.capture_armed.add(window_title)
+                logging.info("OCR observer armed window=%s", window_title)
+                continue
+            if previous_digest == digest:
+                continue
             raw = self.read_text(window_title, image)
             if raw:
+                receipt = parse_receipt(window_title, raw)
+                if receipt is not None:
+                    identity = str(receipt["receipt_identity"])
+                    if self.last_receipt_identity.get(window_title) == identity:
+                        continue
+                    self.last_receipt_identity[window_title] = identity
                 yield window_title, raw
 
     def has_candidate_window(self) -> bool:
@@ -519,7 +561,12 @@ class WeChatOcrObserver:
 
     def prepare_window_for_capture(self, handle: int) -> bool:
         if not self.user32.IsIconic(handle):
+            self.restore_retry_at.pop(handle, None)
             return True
+        now = time.monotonic()
+        if now < self.restore_retry_at.get(handle, 0):
+            return False
+        self.restore_retry_at[handle] = now + max(5.0, self.settings.poll_interval * 2)
         placement = self.get_window_placement(handle)
         if placement is None:
             return False
@@ -537,7 +584,12 @@ class WeChatOcrObserver:
         placement.show_cmd = 4  # SW_SHOWNOACTIVATE
         if not self.user32.SetWindowPlacement(handle, ctypes.byref(placement)):
             return False
-        logging.info("restored minimized WeChat window handle=%s size=%dx%d", handle, width, height)
+        self.user32.ShowWindowAsync(handle, 4)
+        if self.settings.background_window:
+            self.move_to_background(handle)
+        if handle not in self.restore_logged_handles:
+            logging.info("restored minimized WeChat window handle=%s size=%dx%d", handle, width, height)
+            self.restore_logged_handles.add(handle)
         return False
 
     def find_window(self, expected_title: str) -> int | None:

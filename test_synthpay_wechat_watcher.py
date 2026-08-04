@@ -91,6 +91,16 @@ class WindowsWatcherUnitTest(unittest.TestCase):
         }
         self.assertEqual(make_event_id("微信收款助手", receipt), make_event_id("微信收款助手", receipt))
 
+    def test_minute_receipt_identity_survives_recapture(self) -> None:
+        raw = "个人收款服务 收款到账通知08月04日16:10收款金额￥5.00"
+        first = parse_receipt("微信收款助手", raw, datetime(2026, 8, 4, 16, 10, 18))
+        second = parse_receipt("微信收款助手", raw, datetime(2026, 8, 4, 16, 11, 5))
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first["observed_at"], second["observed_at"])
+        self.assertEqual(first["receipt_identity"], second["receipt_identity"])
+        self.assertEqual(make_event_id("微信收款助手", first), make_event_id("微信收款助手", second))
+
     def test_signature_matches_backend(self) -> None:
         timestamp = "1785558600123"
         observed_at = "1785558600000"
