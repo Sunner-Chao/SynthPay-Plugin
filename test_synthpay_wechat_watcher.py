@@ -20,6 +20,7 @@ from synthpay_wechat_watcher import (  # noqa: E402
     sign_payload,
     WindowCandidate,
     select_capture_window,
+    expand_windows_environment,
 )
 
 
@@ -117,21 +118,31 @@ class WindowsWatcherUnitTest(unittest.TestCase):
         self.assertEqual(sign_payload(timestamp, content, event_id, observed_at, secret), expected)
 
     def test_config_expands_windows_environment_variable(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "watcher.ini"
-            config_path.write_text(
-                "[watcher]\n"
-                "dry_run = 1\n"
-                "state_dir = %LOCALAPPDATA%\\SynthPay\\wechat-watcher\\state\n",
-                encoding="utf-8",
-            )
-            settings = Settings.load(config_path)
+        previous = os.environ.get("LOCALAPPDATA")
+        os.environ["LOCALAPPDATA"] = "C:\\Users\\test\\AppData\\Local"
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                config_path = Path(directory) / "watcher.ini"
+                config_path.write_text(
+                    "[watcher]\n"
+                    "dry_run = 1\n"
+                    "state_dir = %LOCALAPPDATA%\\SynthPay\\wechat-watcher\\state\n",
+                    encoding="utf-8",
+                )
+                settings = Settings.load(config_path)
+        finally:
+            if previous is None:
+                del os.environ["LOCALAPPDATA"]
+            else:
+                os.environ["LOCALAPPDATA"] = previous
 
-        self.assertNotIn("%LOCALAPPDATA%", str(settings.state_dir))
-        self.assertTrue(str(settings.state_dir).endswith(os.path.join("SynthPay", "wechat-watcher", "state")))
+        self.assertEqual(str(settings.state_dir), "C:\\Users\\test\\AppData\\Local\\SynthPay\\wechat-watcher\\state")
         self.assertFalse(settings.use_system_proxy)
         self.assertEqual(settings.observer_mode, "auto")
         self.assertTrue(settings.background_window)
+
+    def test_environment_expansion_preserves_unknown_percent_variable(self) -> None:
+        self.assertEqual(expand_windows_environment("%MISSING_TEST_VALUE%\\state"), "%MISSING_TEST_VALUE%\\state")
 
 
 if __name__ == "__main__":

@@ -77,6 +77,16 @@ def config_bool(section: configparser.SectionProxy, key: str, default: bool) -> 
     return section.get(key, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def expand_windows_environment(value: str) -> str:
+    """Expand defined %NAME% values without hiding configuration typos."""
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        return os.environ.get(name, os.environ.get(name.upper(), match.group(0)))
+
+    expanded = re.sub(r"%([^%]+)%", replace, value)
+    return os.path.expandvars(expanded)
+
+
 def money_to_cents(value: str) -> int:
     if re.fullmatch(r"\d+(?:\.\d{1,2})?", value) is None:
         raise ValueError("invalid money")
@@ -180,7 +190,7 @@ class Settings:
         if not parser.read(path, encoding="utf-8"):
             raise ValueError(f"configuration file not found: {path}")
         section = parser["watcher"]
-        state_value = os.path.expandvars(section.get("state_dir", r"%PROGRAMDATA%\SynthPay\wechat-watcher"))
+        state_value = expand_windows_environment(section.get("state_dir", r"%PROGRAMDATA%\SynthPay\wechat-watcher"))
         observer_mode = section.get("observer_mode", "auto").strip().lower()
         if observer_mode not in {"auto", "uia", "ocr"}:
             raise ValueError("observer_mode must be auto, uia, or ocr")
@@ -195,12 +205,12 @@ class Settings:
             use_system_proxy=config_bool(section, "use_system_proxy", False),
             observer_mode=observer_mode,
             tesseract_path=Path(
-                os.path.expandvars(
+                expand_windows_environment(
                     section.get("tesseract_path", r"%ProgramFiles%\Tesseract-OCR\tesseract.exe")
                 )
             ),
             tessdata_dir=Path(
-                os.path.expandvars(section.get("tessdata_dir", r"%ProgramFiles%\Tesseract-OCR\tessdata"))
+                expand_windows_environment(section.get("tessdata_dir", r"%ProgramFiles%\Tesseract-OCR\tessdata"))
             ),
             background_window=config_bool(section, "background_window", True),
             background_x=int(section.get("background_x", "-10000")),
