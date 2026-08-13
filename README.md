@@ -22,7 +22,27 @@
 - 微信 4.x 使用常驻 RapidOCR 做快速识别，并在疑似收款时用 Tesseract `chi_sim`、`eng` 模型交叉校验金额；默认 Tesseract 路径为 `%ProgramFiles%\Tesseract-OCR`。
 - watcher 必须运行在登录微信的同一 Windows 用户会话，不能作为 SYSTEM 服务运行。
 
-## 安装
+## 在全新 Windows 设备一键安装
+
+不能无条件保证任意 Windows 设备可用：设备必须有 Windows 10/11（或带交互桌面的 Windows Server）、网络、`winget`（App Installer）、已登录的 Windows 用户会话和已登录微信；生产模式还必须由操作者提供 SynthPay 回调 URL 与密钥。脚本不会也不能替用户登录微信、生成服务器授权，或绕过微信客户端的窗口行为。
+
+下载或克隆仓库后，双击 `setup-and-start.cmd`。它会自动检查或安装 Python 3.10、Tesseract，并将 `chi_sim`/`eng` 识别数据放到当前用户目录，创建隔离运行环境，首次交互式配置生产回调（直接回车则按 `dry_run=1` 启动），注册当前用户登录时自动运行的任务并立即启动 watcher。
+
+也可在 PowerShell 中运行：
+
+```powershell
+.\setup-and-start.ps1
+```
+
+无界面部署可传入回调配置：
+
+```powershell
+.\setup-and-start.ps1 -NonInteractive -CallbackUrl "https://example.com/api/pay/1/notify" -CallbackSecret "your-secret"
+```
+
+脚本只写入当前 Windows 用户的 `%APPDATA%\SynthPay\wechat-watcher.ini`，不会将密钥提交进仓库。若配置已经存在，会保留它。
+
+## 手动安装
 
 以普通 Windows 用户打开 PowerShell：
 

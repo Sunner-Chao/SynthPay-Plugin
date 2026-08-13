@@ -1,3 +1,8 @@
+param(
+    [string]$PythonExecutable,
+    [switch]$Start
+)
+
 $ErrorActionPreference = "Stop"
 
 $InstallDir = Join-Path $env:LOCALAPPDATA "SynthPay\wechat-watcher"
@@ -6,6 +11,23 @@ $ConfigPath = Join-Path $ConfigDir "wechat-watcher.ini"
 $TaskName = "SynthPay WeChat Watcher"
 $SourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
+    $PythonLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($PythonLauncher) {
+        $PythonExecutable = & $PythonLauncher.Source -3.10 -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1
+        if ($PythonExecutable) {
+            $PythonExecutable = $PythonExecutable.Trim()
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($PythonExecutable) -or -not (Test-Path -LiteralPath $PythonExecutable)) {
+    throw "Python 3.10 was not found. Run setup-and-start.cmd, or pass -PythonExecutable with a valid Python 3.10 path."
+}
+$PythonVersion = (& $PythonExecutable -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null | Select-Object -First 1).Trim()
+if ($PythonVersion -ne "3.10") {
+    throw "SynthPay watcher requires Python 3.10; found Python $PythonVersion at $PythonExecutable."
+}
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
@@ -23,7 +45,7 @@ if ($LASTEXITCODE -ne 0) {
 $VenvDir = Join-Path $InstallDir ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 if (-not (Test-Path $VenvPython)) {
-    py -3 -m venv $VenvDir
+    & $PythonExecutable -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to create watcher Python environment"
     }
@@ -42,5 +64,10 @@ $Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interact
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Force | Out-Null
 
 Write-Host "Installed to $InstallDir"
-Write-Host "Edit $ConfigPath, keep dry_run=1 for the first real receipt test, then run:"
-Write-Host "Start-ScheduledTask -TaskName '$TaskName'"
+Write-Host "Configuration: $ConfigPath"
+if ($Start) {
+    Start-ScheduledTask -TaskName $TaskName
+    Write-Host "Watcher task started."
+} else {
+    Write-Host "Run setup-and-start.cmd for guided configuration and immediate startup."
+}
