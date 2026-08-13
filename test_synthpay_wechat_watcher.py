@@ -18,6 +18,7 @@ from synthpay_wechat_watcher import (  # noqa: E402
     make_event_id,
     money_to_cents,
     parse_receipt,
+    parse_receipts,
     Settings,
     sign_payload,
     WindowCandidate,
@@ -54,6 +55,40 @@ class WindowsWatcherUnitTest(unittest.TestCase):
         self.assertIsNotNone(receipt)
         self.assertEqual(receipt["amount_cents"], 1)
         self.assertEqual(receipt["observed_at"], int(captured_at.timestamp() * 1000))
+
+    def test_two_personal_receipts_in_one_capture(self) -> None:
+        raw = (
+            "个人收款服务 收款到账通知08月13日23:32收款金额￥1.23"
+            "今日第1笔收款备注收款成功，已存入零钱。"
+            "个人收款服务 收款到账通知08月13日23:34收款金额￥4.56"
+            "今日第2笔收款备注收款成功，已存入零钱。"
+        )
+        receipts = parse_receipts("微信收款助手", raw, datetime(2026, 8, 14, 0, 5, 0))
+        self.assertEqual([receipt["amount_cents"] for receipt in receipts], [123, 456])
+        self.assertEqual(
+            [datetime.fromtimestamp(receipt["observed_at"] / 1000) for receipt in receipts],
+            [datetime(2026, 8, 13, 23, 32, 59, 999000), datetime(2026, 8, 13, 23, 34, 59, 999000)],
+        )
+
+    def test_partial_personal_receipt_card_is_accepted(self) -> None:
+        raw = (
+            "微信收款助手08月13日23:32收款金额￥50.00汇总"
+            "今日第2笔收款，共计￥74.95备注收款成功，已存入零钱。点击可查"
+        )
+        receipt = parse_receipt("微信收款助手", raw, datetime(2026, 8, 14, 5, 30, 0))
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["amount_cents"], 5000)
+        self.assertEqual(
+            receipt["observed_at"],
+            int(datetime(2026, 8, 13, 23, 32, 59, 999000).timestamp() * 1000),
+        )
+
+    def test_partial_personal_receipt_without_time_is_ignored(self) -> None:
+        raw = (
+            "微信收款助手收款金额￥50.00汇总"
+            "今日第2笔收款，共计￥74.95备注收款成功，已存入零钱。点击可查"
+        )
+        self.assertIsNone(parse_receipt("微信收款助手", raw, datetime(2026, 8, 14, 5, 30, 0)))
 
     def test_money_conversion(self) -> None:
         self.assertEqual(money_to_cents("10"), 1000)
@@ -142,9 +177,22 @@ class WindowsWatcherUnitTest(unittest.TestCase):
         self.assertFalse(settings.use_system_proxy)
         self.assertEqual(settings.observer_mode, "auto")
         self.assertTrue(settings.background_window)
+        self.assertEqual(settings.receipt_lookback_seconds, 24 * 60 * 60)
 
     def test_environment_expansion_preserves_unknown_percent_variable(self) -> None:
         self.assertEqual(expand_windows_environment("%MISSING_TEST_VALUE%\\state"), "%MISSING_TEST_VALUE%\\state")
+
+    def test_invalid_window_title_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "watcher.ini"
+            config_path.write_text(
+                "[watcher]\n"
+                "dry_run = 1\n"
+                "window_titles = 寰信收款助手\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unsupported window_titles"):
+                Settings.load(config_path)
 
 
 class TesseractHealthTest(unittest.TestCase):

@@ -68,5 +68,6 @@ Start-ScheduledTask -TaskName "SynthPay WeChat Watcher"
 首次保持 `dry_run=1`，支付 `0.01` 元并检查 `%LOCALAPPDATA%\SynthPay\wechat-watcher\state\watcher.log`。确认只生成一条事件后，再配置真实通道 ID 和密钥并切换 `dry_run=0`。
 
 本地 SQLite 会保存待发送事件并指数退避重试；同一通知使用稳定事件 ID，重启不会重复入账。日志不保存微信通知原文。
+默认会补扫当前微信收款助手窗口中最近 24 小时的可见通知，并按通知时间与金额去重；可通过 `receipt_lookback_minutes` 调整。即使卡片顶部在滚动时被裁掉，只要原始通知时间、金额、当日收款序号和入账状态均可识别，也会安全补录。
 默认 `use_system_proxy=0`，回调不读取 Windows 用户环境中的代理设置；仅在云端必须经过系统代理时才改为 `1`。
 默认 `background_window=1`，检测到“微信收款助手”独立窗口后会将它移到屏幕外，保持后台渲染供 OCR 使用，不抢占前台焦点。

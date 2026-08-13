@@ -174,6 +174,7 @@ state_dir = %LOCALAPPDATA%\SynthPay\wechat-watcher\state
 poll_interval_seconds = 2
 http_timeout_seconds = 8
 max_attempts = 30
+receipt_lookback_minutes = 1440
 use_system_proxy = 0
 observer_mode = auto
 tesseract_path = $(Escape-IniValue $Tesseract.Executable)
@@ -191,7 +192,7 @@ function Get-ExistingConfigValue([string]$Key) {
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
         return ""
     }
-    $match = Get-Content -LiteralPath $ConfigPath | Where-Object { $_ -match ("^\s*" + [regex]::Escape($Key) + "\s*=") } | Select-Object -First 1
+    $match = Get-Content -LiteralPath $ConfigPath -Encoding UTF8 | Where-Object { $_ -match ("^\s*" + [regex]::Escape($Key) + "\s*=") } | Select-Object -First 1
     if (-not $match) {
         return ""
     }
@@ -212,7 +213,7 @@ function Update-MachineSpecificConfiguration([object]$Tesseract) {
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
         return
     }
-    $lines = @(Get-Content -LiteralPath $ConfigPath)
+    $lines = @(Get-Content -LiteralPath $ConfigPath -Encoding UTF8)
     $updated = @()
     $seenTesseract = $false
     $seenTessdata = $false

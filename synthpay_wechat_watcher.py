@@ -33,35 +33,35 @@ RECEIPT_PATTERNS = (
         "channel": "1",
         "titles": {"微信支付", "微信收款助手", "微信商家助手"},
         "message": re.compile(r"(?:个人收款服务|收款到账通知)"),
-        "money": re.compile(r"收款金额[：:]?[￥¥](\d+(?:\.\d{1,2})?)"),
+        "money": re.compile(r"收款金额[：:]?[￥¥￥](\d+(?:\.\d{1,2})?)"),
         "time": re.compile(r"收款到账通知(\d{2}月\d{2}日\d{2}:\d{2})(?=收款金额)"),
     },
     {
         "channel": "2",
         "titles": {"微信支付"},
         "message": re.compile(r"赞赏到账通知"),
-        "money": re.compile(r"收款金额[：:]?[￥¥](\d+(?:\.\d{1,2})?)"),
+        "money": re.compile(r"收款金额[：:]?[￥¥￥](\d+(?:\.\d{1,2})?)"),
         "time": re.compile(r"到账时间(\d{4}-\d{2}-\d{2}\d{2}:\d{2}:\d{2})"),
     },
     {
         "channel": "3",
         "titles": {"微信收款助手", "微信商家助手"},
         "message": re.compile(r"经营收款"),
-        "money": re.compile(r"收款金额[：:]?[￥¥](\d+(?:\.\d{1,2})?)"),
+        "money": re.compile(r"收款金额[：:]?[￥¥￥](\d+(?:\.\d{1,2})?)"),
         "time": re.compile(r"经营码收款到账通知(\d{2}月\d{2}日\d{2}:\d{2})(?=收款金额)"),
     },
     {
         "channel": "4",
         "titles": {"微信收款商业版", "微信商家助手"},
         "message": re.compile(r"收款通知"),
-        "money": re.compile(r"收款金额[：:]?[￥¥](\d+(?:\.\d{1,2})?)"),
+        "money": re.compile(r"收款金额[：:]?[￥¥￥](\d+(?:\.\d{1,2})?)"),
         "time": re.compile(r"收款通知(\d{2}月\d{2}日\d{2}:\d{2}:\d{2})(?=收款金额)"),
     },
     {
         "channel": "5",
         "titles": {"微信收款助手", "微信商家助手"},
         "message": re.compile(r"收款到账通知.+已存入店长"),
-        "money": re.compile(r"收款金额[：:]?[￥¥](\d+(?:\.\d{1,2})?)"),
+        "money": re.compile(r"收款金额[：:]?[￥¥￥](\d+(?:\.\d{1,2})?)"),
         "time": re.compile(r"收款到账通知(\d{2}月\d{2}日\d{2}:\d{2})(?=收款金额)"),
     },
 )
@@ -70,6 +70,13 @@ WECHAT_CHAT_WINDOW_CLASSES = ("ChatWnd", "mmui::ChatSingleWindow")
 OCR_WECHAT_WINDOW_CLASS_PREFIX = "Qt"
 OCR_WECHAT_PROCESS_NAME = "weixin.exe"
 TESSERACT_LANGUAGES = ("chi_sim", "eng")
+SUPPORTED_WINDOW_TITLES = frozenset(
+    title for pattern in RECEIPT_PATTERNS for title in pattern["titles"]
+)
+PARTIAL_PERSONAL_RECEIPT = re.compile(
+    r"收款金额.*?今日第\d+笔收款.*?收款成功.*?已存入零钱"
+)
+PARTIAL_RECEIPT_TIME = re.compile(r"(\d{2}月\d{2}日\d{2}:\d{2})")
 
 
 def config_bool(section: configparser.SectionProxy, key: str, default: bool) -> bool:
@@ -106,42 +113,70 @@ def parse_observed_at(value: str, now: datetime | None = None) -> datetime:
         except ValueError:
             continue
 
-    # WeChat personal-receipt notifications only display a minute.  Treating
-    # that minute as :00 can place the receipt before the payment order was
-    # created, so use the actual capture time when seconds are unavailable.
+    # Personal-receipt notifications omit seconds. Preserve the capture
+    # second for a live notification; use the end of the displayed minute
+    # when replaying an older notification after a watcher restart.
     if re.fullmatch(r"\d{2}月\d{2}日\d{2}:\d{2}", value):
-        return now
+        parsed = datetime.strptime(value, "%m月%d日%H:%M").replace(year=now.year)
+        age = now - parsed
+        if 0 <= age.total_seconds() < 120:
+            return now
+        return parsed.replace(second=59, microsecond=999000)
     return now
 
 
-def parse_receipt(window_title: str, raw_text: str, now: datetime | None = None) -> dict[str, Any] | None:
+def parse_receipts(window_title: str, raw_text: str, now: datetime | None = None) -> list[dict[str, Any]]:
     captured_at = now or datetime.now()
     normalized = "".join(str(raw_text).split())
-    raw_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    receipts: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for pattern in RECEIPT_PATTERNS:
-        if window_title not in pattern["titles"] or pattern["message"].search(normalized) is None:
+        complete_receipt = pattern["message"].search(normalized) is not None
+        partial_personal_receipt = (
+            not complete_receipt
+            and pattern["channel"] == "1"
+            and PARTIAL_PERSONAL_RECEIPT.search(normalized) is not None
+        )
+        if window_title not in pattern["titles"] or not (complete_receipt or partial_personal_receipt):
             continue
-        money_match = pattern["money"].search(normalized)
-        if money_match is None:
-            continue
-        time_match = pattern["time"].search(normalized)
-        source_time = time_match.group(1) if time_match else ""
-        observed = parse_observed_at(source_time, captured_at) if source_time else captured_at
-        source_identity = source_time or raw_digest
-        if source_time and not source_time.startswith(str(captured_at.year)):
-            source_identity = f"{captured_at.year}:{source_time}"
-        receipt_identity = hashlib.sha256(
-            "\n".join((window_title, str(pattern["channel"]), money_match.group(1), source_identity)).encode("utf-8")
-        ).hexdigest()
-        return {
-            "channel": str(pattern["channel"]),
-            "money": money_match.group(1),
-            "amount_cents": money_to_cents(money_match.group(1)),
-            "observed_at": int(observed.timestamp() * 1000),
-            "raw_digest": raw_digest,
-            "receipt_identity": receipt_identity,
-        }
-    return None
+        segment_start = 0
+        for money_match in pattern["money"].finditer(normalized):
+            segment = normalized if partial_personal_receipt else normalized[segment_start:money_match.end()]
+            segment_start = money_match.end()
+            if not partial_personal_receipt and pattern["message"].search(segment) is None:
+                continue
+            time_pattern = PARTIAL_RECEIPT_TIME if partial_personal_receipt else pattern["time"]
+            time_matches = list(time_pattern.finditer(segment))
+            source_time = time_matches[-1].group(1) if time_matches else ""
+            if partial_personal_receipt and not source_time:
+                continue
+            segment_digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()
+            observed = parse_observed_at(source_time, captured_at) if source_time else captured_at
+            source_identity = source_time or segment_digest
+            if source_time and not source_time.startswith(str(captured_at.year)):
+                source_identity = f"{captured_at.year}:{source_time}"
+            receipt_identity = hashlib.sha256(
+                "\n".join((window_title, str(pattern["channel"]), money_match.group(1), source_identity)).encode("utf-8")
+            ).hexdigest()
+            if receipt_identity in seen:
+                continue
+            seen.add(receipt_identity)
+            receipts.append(
+                {
+                    "channel": str(pattern["channel"]),
+                    "money": money_match.group(1),
+                    "amount_cents": money_to_cents(money_match.group(1)),
+                    "observed_at": int(observed.timestamp() * 1000),
+                    "raw_digest": segment_digest,
+                    "receipt_identity": receipt_identity,
+                }
+            )
+    return receipts
+
+
+def parse_receipt(window_title: str, raw_text: str, now: datetime | None = None) -> dict[str, Any] | None:
+    receipts = parse_receipts(window_title, raw_text, now)
+    return receipts[0] if receipts else None
 
 
 def make_event_id(window_title: str, receipt: dict[str, Any]) -> str:
@@ -175,6 +210,7 @@ class Settings:
     poll_interval: float
     http_timeout: float
     max_attempts: int
+    receipt_lookback_seconds: float
     dry_run: bool
     use_system_proxy: bool
     observer_mode: str
@@ -195,6 +231,14 @@ class Settings:
         observer_mode = section.get("observer_mode", "auto").strip().lower()
         if observer_mode not in {"auto", "uia", "ocr"}:
             raise ValueError("observer_mode must be auto, uia, or ocr")
+        windows = tuple(
+            item.strip()
+            for item in section.get(
+                "window_titles",
+                "微信支付,微信收款助手,微信收款商业版,微信商家助手",
+            ).split(",")
+            if item.strip()
+        )
         settings = cls(
             callback_url=section.get("callback_url", "").strip(),
             callback_secret=section.get("callback_secret", ""),
@@ -202,6 +246,7 @@ class Settings:
             poll_interval=max(1.0, float(section.get("poll_interval_seconds", "2"))),
             http_timeout=max(1.0, float(section.get("http_timeout_seconds", "8"))),
             max_attempts=max(1, int(section.get("max_attempts", "30"))),
+            receipt_lookback_seconds=max(60.0, float(section.get("receipt_lookback_minutes", "1440")) * 60),
             dry_run=config_bool(section, "dry_run", True),
             use_system_proxy=config_bool(section, "use_system_proxy", False),
             observer_mode=observer_mode,
@@ -218,15 +263,12 @@ class Settings:
             background_window=config_bool(section, "background_window", True),
             background_x=int(section.get("background_x", "-10000")),
             background_y=int(section.get("background_y", "-10000")),
-            windows=tuple(
-                item.strip()
-                for item in section.get(
-                    "window_titles",
-                    "微信支付,微信收款助手,微信收款商业版,微信商家助手",
-                ).split(",")
-                if item.strip()
-            ),
+            windows=windows,
         )
+        unsupported_titles = sorted(set(settings.windows) - SUPPORTED_WINDOW_TITLES)
+        if not settings.windows or unsupported_titles:
+            invalid = ", ".join(repr(title) for title in unsupported_titles) or "<empty>"
+            raise ValueError(f"unsupported window_titles: {invalid}")
         if not settings.dry_run and (not settings.callback_url or not settings.callback_secret):
             raise ValueError("callback_url and callback_secret are required")
         if settings.callback_url and not settings.callback_url.lower().startswith("https://"):
@@ -524,7 +566,6 @@ class WeChatOcrObserver:
         self.attached_handles: dict[str, int] = {}
         self.capture_warmup_until: dict[str, float] = {}
         self.capture_armed: set[str] = set()
-        self.last_receipt_identity: dict[str, str] = {}
         self.restore_retry_at: dict[int, float] = {}
         self.restore_logged_handles: set[int] = set()
         self.rapid_ocr: Any | None = None
@@ -571,22 +612,15 @@ class WeChatOcrObserver:
                 if time.monotonic() < self.capture_warmup_until.get(window_title, 0):
                     continue
                 raw = self.read_text(window_title, image)
-                receipt = parse_receipt(window_title, raw) if raw else None
-                if receipt is not None:
-                    self.last_receipt_identity[window_title] = str(receipt["receipt_identity"])
                 self.capture_armed.add(window_title)
                 logging.info("OCR observer armed window=%s", window_title)
+                if raw:
+                    yield window_title, raw
                 continue
             if previous_digest == digest:
                 continue
             raw = self.read_text(window_title, image)
             if raw:
-                receipt = parse_receipt(window_title, raw)
-                if receipt is not None:
-                    identity = str(receipt["receipt_identity"])
-                    if self.last_receipt_identity.get(window_title) == identity:
-                        continue
-                    self.last_receipt_identity[window_title] = identity
                 yield window_title, raw
 
     def has_candidate_window(self) -> bool:
@@ -948,40 +982,45 @@ def main(argv: list[str] | None = None) -> int:
         while not stopping.wait(settings.poll_interval):
             try:
                 for window_title, raw_text in observer.latest_receipts():
-                    receipt = parse_receipt(window_title, raw_text)
-                    if receipt is None:
-                        continue
-                    event_id = make_event_id(window_title, receipt)
-                    observed_at = str(receipt["observed_at"])
-                    content = json.dumps(
-                        {
-                            "title": window_title,
-                            "msg": f"收款到账 {receipt['money']} 元",
-                            "receipt_type": receipt["channel"],
-                            "receipt_digest": receipt["raw_digest"],
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    payload = {
-                        "timestamp": observed_at,
-                        "observed_at": observed_at,
-                        "content": content,
-                        "from": "com.tencent.mm",
-                        "source": "windows_wechat_ui",
-                        "event_id": event_id,
-                        "sign_version": "2",
-                        "sign": sign_payload(
-                            observed_at,
-                            content,
-                            event_id,
-                            observed_at,
-                            settings.callback_secret,
-                        ),
-                    }
-                    if store.enqueue(event_id, payload):
-                        logging.info("receipt queued event_id=%s amount_cents=%d", event_id[:12], receipt["amount_cents"])
-                        wake.set()
+                    for receipt in parse_receipts(window_title, raw_text):
+                        age_seconds = time.time() - receipt["observed_at"] / 1000
+                        if age_seconds > settings.receipt_lookback_seconds or age_seconds < -300:
+                            logging.info(
+                                "receipt outside lookback ignored event_age_seconds=%d",
+                                int(age_seconds),
+                            )
+                            continue
+                        event_id = make_event_id(window_title, receipt)
+                        observed_at = str(receipt["observed_at"])
+                        content = json.dumps(
+                            {
+                                "title": window_title,
+                                "msg": f"收款到账 {receipt['money']} 元",
+                                "receipt_type": receipt["channel"],
+                                "receipt_digest": receipt["raw_digest"],
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        payload = {
+                            "timestamp": observed_at,
+                            "observed_at": observed_at,
+                            "content": content,
+                            "from": "com.tencent.mm",
+                            "source": "windows_wechat_ui",
+                            "event_id": event_id,
+                            "sign_version": "2",
+                            "sign": sign_payload(
+                                observed_at,
+                                content,
+                                event_id,
+                                observed_at,
+                                settings.callback_secret,
+                            ),
+                        }
+                        if store.enqueue(event_id, payload):
+                            logging.info("receipt queued event_id=%s amount_cents=%d", event_id[:12], receipt["amount_cents"])
+                            wake.set()
             except Exception:
                 logging.exception("WeChat UI observation failed")
         return 0
