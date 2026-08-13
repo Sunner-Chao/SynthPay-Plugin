@@ -20,3 +20,9 @@ wechat-watcher.ini
 
 # Repository-management helpers are local-only
 git_shell/
+
+# Local installers, OCR model cache, and machine-specific setup
+vendor/
+models/*.traineddata
+wechat-watcher.local.ini
+*.download

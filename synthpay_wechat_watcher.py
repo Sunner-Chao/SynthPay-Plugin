@@ -69,6 +69,7 @@ RECEIPT_PATTERNS = (
 WECHAT_CHAT_WINDOW_CLASSES = ("ChatWnd", "mmui::ChatSingleWindow")
 OCR_WECHAT_WINDOW_CLASS_PREFIX = "Qt"
 OCR_WECHAT_PROCESS_NAME = "weixin.exe"
+TESSERACT_LANGUAGES = ("chi_sim", "eng")
 
 
 def config_bool(section: configparser.SectionProxy, key: str, default: bool) -> bool:
@@ -210,7 +211,9 @@ class Settings:
                 )
             ),
             tessdata_dir=Path(
-                expand_windows_environment(section.get("tessdata_dir", r"%ProgramFiles%\Tesseract-OCR\tessdata"))
+                expand_windows_environment(
+                    section.get("tessdata_dir", r"%LOCALAPPDATA%\SynthPay\wechat-watcher\tessdata")
+                )
             ),
             background_window=config_bool(section, "background_window", True),
             background_x=int(section.get("background_x", "-10000")),
@@ -478,6 +481,42 @@ def select_capture_window(candidates: Iterable[WindowCandidate]) -> int | None:
     return max(usable, key=lambda candidate: candidate.area).handle if usable else None
 
 
+def check_tesseract_languages(executable: Path, tessdata_dir: Path) -> tuple[bool, str]:
+    """Confirm that the configured Tesseract binary can load the required models."""
+    missing_files = [
+        language for language in TESSERACT_LANGUAGES if not (tessdata_dir / f"{language}.traineddata").is_file()
+    ]
+    if not executable.is_file():
+        return False, f"Tesseract executable not found: {executable}"
+    if not tessdata_dir.is_dir():
+        return False, f"Tesseract data directory not found: {tessdata_dir}"
+    if missing_files:
+        return False, f"missing model files: {', '.join(missing_files)}"
+    try:
+        completed = subprocess.run(
+            [str(executable), "--tessdata-dir", str(tessdata_dir), "--list-langs"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            check=False,
+            creationflags=0x08000000 if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Tesseract language check failed: {exc}"
+    if completed.returncode != 0:
+        error = completed.stderr.decode("utf-8", errors="replace").strip()
+        return False, f"Tesseract language check failed: {error[:200]}"
+    languages = {
+        line.strip()
+        for line in completed.stdout.decode("utf-8", errors="replace").splitlines()
+        if line.strip() and not line.lstrip().startswith("List of available languages")
+    }
+    missing_languages = [language for language in TESSERACT_LANGUAGES if language not in languages]
+    if missing_languages:
+        return False, f"Tesseract cannot load: {', '.join(missing_languages)}"
+    return True, ""
+
+
 class WeChatOcrObserver:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -490,9 +529,15 @@ class WeChatOcrObserver:
         self.restore_logged_handles: set[int] = set()
         self.rapid_ocr: Any | None = None
         self.rapid_ocr_failed = False
-        self.available = os.name == "nt" and settings.tesseract_path.is_file() and settings.tessdata_dir.is_dir()
+        self.tesseract_available = False
+        self.tesseract_status = "Windows is required"
+        self.tesseract_fallback_logged = False
+        self.available = os.name == "nt"
         if os.name != "nt":
             return
+        self.tesseract_available, self.tesseract_status = check_tesseract_languages(
+            settings.tesseract_path, settings.tessdata_dir
+        )
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -717,6 +762,16 @@ class WeChatOcrObserver:
     def read_text(self, window_title: str, image: bytes) -> str:
         rapid_text = self.read_rapid_text(image)
         rapid_receipt = parse_receipt(window_title, rapid_text) if rapid_text else None
+
+        if not self.tesseract_available:
+            if not self.tesseract_fallback_logged:
+                logging.warning("Tesseract unavailable; RapidOCR-only receipt detection is active reason=%s", self.tesseract_status)
+                self.tesseract_fallback_logged = True
+            return rapid_text
+
+        # A failed RapidOCR initialization must still leave the reliable OCR path available.
+        if not rapid_text:
+            return self.read_tesseract_text(image)
         if rapid_receipt is None and "收款" not in rapid_text and "金额" not in rapid_text:
             return rapid_text
 
@@ -786,7 +841,7 @@ class WeChatObserver:
         self.uia = WeChatUiObserver(settings.windows)
         self.ocr = WeChatOcrObserver(settings)
         if settings.observer_mode == "ocr" and not self.ocr.available:
-            raise ValueError("OCR observer requires Tesseract with chi_sim language data")
+            raise ValueError("OCR observer requires Windows")
 
     def latest_receipts(self) -> Iterable[tuple[str, str]]:
         if self.settings.observer_mode == "uia":
@@ -820,68 +875,121 @@ def configure_logging(state_dir: Path) -> None:
     )
 
 
+class WatcherInstanceLock:
+    """Keep scheduled-task restarts and manual launches from duplicating receipt events."""
+
+    def __init__(self, config_path: Path) -> None:
+        self.handle: int | None = None
+        digest = hashlib.sha256(str(config_path.resolve()).encode("utf-8")).hexdigest()[:16]
+        self.name = f"Local\\SynthPayWeChatWatcher-{digest}"
+
+    def acquire(self) -> bool:
+        if os.name != "nt":
+            return True
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            return False
+        self.handle = int(handle)
+        return True
+
+    def close(self) -> None:
+        if self.handle is None or os.name != "nt":
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+        self.handle = None
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     default_config = Path(os.path.expandvars(r"%PROGRAMDATA%\SynthPay\wechat-watcher.ini"))
     config_path = Path(argv[0]) if argv else default_config
     settings = Settings.load(config_path)
     configure_logging(settings.state_dir)
-    lower_process_priority()
-    store = EventStore(settings.state_dir / "events.sqlite3")
-    wake = threading.Event()
-    worker = CallbackWorker(settings, store, wake)
-    observer = WeChatObserver(settings)
-    stopping = threading.Event()
+    instance_lock = WatcherInstanceLock(config_path)
+    if not instance_lock.acquire():
+        logging.info("watcher already running for config=%s", config_path)
+        return 0
+    worker: CallbackWorker | None = None
+    try:
+        lower_process_priority()
+        store = EventStore(settings.state_dir / "events.sqlite3")
+        wake = threading.Event()
+        worker = CallbackWorker(settings, store, wake)
+        observer = WeChatObserver(settings)
+        stopping = threading.Event()
 
-    def stop(_signum: int, _frame: object) -> None:
-        stopping.set()
-        worker.stop()
+        def stop(_signum: int, _frame: object) -> None:
+            stopping.set()
+            worker.stop()
 
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    worker.start()
-    logging.info("watcher started dry_run=%s windows=%s", settings.dry_run, ",".join(settings.windows))
-    while not stopping.wait(settings.poll_interval):
-        try:
-            for window_title, raw_text in observer.latest_receipts():
-                receipt = parse_receipt(window_title, raw_text)
-                if receipt is None:
-                    continue
-                event_id = make_event_id(window_title, receipt)
-                observed_at = str(receipt["observed_at"])
-                content = json.dumps(
-                    {
-                        "title": window_title,
-                        "msg": f"收款到账 {receipt['money']} 元",
-                        "receipt_type": receipt["channel"],
-                        "receipt_digest": receipt["raw_digest"],
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                payload = {
-                    "timestamp": observed_at,
-                    "observed_at": observed_at,
-                    "content": content,
-                    "from": "com.tencent.mm",
-                    "source": "windows_wechat_ui",
-                    "event_id": event_id,
-                    "sign_version": "2",
-                    "sign": sign_payload(
-                        observed_at,
-                        content,
-                        event_id,
-                        observed_at,
-                        settings.callback_secret,
-                    ),
-                }
-                if store.enqueue(event_id, payload):
-                    logging.info("receipt queued event_id=%s amount_cents=%d", event_id[:12], receipt["amount_cents"])
-                    wake.set()
-        except Exception:
-            logging.exception("WeChat UI observation failed")
-    worker.join(timeout=10)
-    return 0
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGTERM, stop)
+        worker.start()
+        logging.info(
+            "watcher started dry_run=%s windows=%s tesseract_ready=%s",
+            settings.dry_run,
+            ",".join(settings.windows),
+            observer.ocr.tesseract_available,
+        )
+        if not observer.ocr.tesseract_available:
+            logging.warning("Tesseract health check failed reason=%s", observer.ocr.tesseract_status)
+        while not stopping.wait(settings.poll_interval):
+            try:
+                for window_title, raw_text in observer.latest_receipts():
+                    receipt = parse_receipt(window_title, raw_text)
+                    if receipt is None:
+                        continue
+                    event_id = make_event_id(window_title, receipt)
+                    observed_at = str(receipt["observed_at"])
+                    content = json.dumps(
+                        {
+                            "title": window_title,
+                            "msg": f"收款到账 {receipt['money']} 元",
+                            "receipt_type": receipt["channel"],
+                            "receipt_digest": receipt["raw_digest"],
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    payload = {
+                        "timestamp": observed_at,
+                        "observed_at": observed_at,
+                        "content": content,
+                        "from": "com.tencent.mm",
+                        "source": "windows_wechat_ui",
+                        "event_id": event_id,
+                        "sign_version": "2",
+                        "sign": sign_payload(
+                            observed_at,
+                            content,
+                            event_id,
+                            observed_at,
+                            settings.callback_secret,
+                        ),
+                    }
+                    if store.enqueue(event_id, payload):
+                        logging.info("receipt queued event_id=%s amount_cents=%d", event_id[:12], receipt["amount_cents"])
+                        wake.set()
+            except Exception:
+                logging.exception("WeChat UI observation failed")
+        return 0
+    finally:
+        if worker is not None:
+            worker.stop()
+            worker.join(timeout=10)
+        instance_lock.close()
 
 
 if __name__ == "__main__":

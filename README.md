@@ -8,7 +8,9 @@
 
 - 后台观察：收款助手窗口可移动到屏幕外，不抢占前台焦点。
 - 双 OCR 引擎：RapidOCR 负责速度，Tesseract 用于金额交叉校验。
+- OCR 自检：启动时验证 `chi_sim`/`eng` 文件和 Tesseract 实际加载结果；RapidOCR 初始化失败时自动使用 Tesseract。
 - 可靠投递：SQLite 队列、指数退避、稳定事件 ID 和重启去重。
+- 单实例运行：Windows 命名互斥锁阻止计划任务与手动启动产生重复监听进程。
 - 可验证回调：HMAC-SHA256 v2 覆盖发送时间、消息内容、事件 ID 与观察时间。
 - 隐私最小化：日志不保存微信通知原文；真实回调密钥仅保存在本机受 ACL 保护的配置文件中。
 
@@ -28,6 +30,8 @@
 
 下载或克隆仓库后，双击 `setup-and-start.cmd`。它会自动检查或安装 Python 3.10、Tesseract，并将 `chi_sim`/`eng` 识别数据放到当前用户目录，创建隔离运行环境，首次交互式配置生产回调（直接回车则按 `dry_run=1` 启动），注册当前用户登录时自动运行的任务并立即启动 watcher。
 
+OCR 模型下载后会进行固定 SHA-256 校验，并通过 `tesseract --list-langs` 确认实际可加载。离线安装时，可将 `chi_sim.traineddata` 和 `eng.traineddata` 放入仓库的 `models` 目录；模型二进制不会提交到 Git。
+
 也可在 PowerShell 中运行：
 
 ```powershell
@@ -41,6 +45,14 @@
 ```
 
 脚本只写入当前 Windows 用户的 `%APPDATA%\SynthPay\wechat-watcher.ini`，不会将密钥提交进仓库。若配置已经存在，会保留它。
+
+若 Tesseract 升级或模型文件损坏，可运行：
+
+```powershell
+.\repair-ocr.ps1
+```
+
+修复脚本会将官方模型安装到 `%LOCALAPPDATA%\SynthPay\wechat-watcher\tessdata`，完成哈希与语言加载验证。监听器启动日志中的 `tesseract_ready=True` 表示双 OCR 校验可用。
 
 ## 手动安装
 

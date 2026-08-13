@@ -12,6 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import synthpay_wechat_watcher as watcher  # noqa: E402
+
 from synthpay_wechat_watcher import (  # noqa: E402
     make_event_id,
     money_to_cents,
@@ -143,6 +145,50 @@ class WindowsWatcherUnitTest(unittest.TestCase):
 
     def test_environment_expansion_preserves_unknown_percent_variable(self) -> None:
         self.assertEqual(expand_windows_environment("%MISSING_TEST_VALUE%\\state"), "%MISSING_TEST_VALUE%\\state")
+
+
+class TesseractHealthTest(unittest.TestCase):
+    def test_missing_model_is_reported_without_running_tesseract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ready, reason = watcher.check_tesseract_languages(
+                Path(temporary_directory) / "missing.exe",
+                Path(temporary_directory),
+            )
+        self.assertFalse(ready)
+        self.assertIn("executable not found", reason)
+
+    def test_tesseract_fallback_runs_when_rapidocr_returns_no_text(self) -> None:
+        observer = object.__new__(watcher.WeChatOcrObserver)
+        observer.tesseract_available = True
+        observer.read_rapid_text = lambda _image: ""
+        observer.read_tesseract_text = lambda _image: "Tesseract fallback text"
+
+        self.assertEqual(observer.read_text("微信收款助手", b"image"), "Tesseract fallback text")
+
+    def test_rapidocr_text_is_retained_when_tesseract_is_unavailable(self) -> None:
+        observer = object.__new__(watcher.WeChatOcrObserver)
+        observer.tesseract_available = False
+        observer.tesseract_status = "missing model files: chi_sim"
+        observer.tesseract_fallback_logged = False
+        observer.read_rapid_text = lambda _image: "no receipt yet"
+
+        self.assertEqual(observer.read_text("微信收款助手", b"image"), "no receipt yet")
+        self.assertTrue(observer.tesseract_fallback_logged)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows mutex test")
+class InstanceLockTest(unittest.TestCase):
+    def test_second_lock_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "watcher.ini"
+            first = watcher.WatcherInstanceLock(config_path)
+            second = watcher.WatcherInstanceLock(config_path)
+            self.assertTrue(first.acquire())
+            try:
+                self.assertFalse(second.acquire())
+            finally:
+                second.close()
+                first.close()
 
 
 if __name__ == "__main__":

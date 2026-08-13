@@ -11,15 +11,24 @@ $ErrorActionPreference = "Stop"
 $SourceDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfigDir = Join-Path $env:APPDATA "SynthPay"
 $ConfigPath = Join-Path $ConfigDir "wechat-watcher.ini"
+$ModelCacheDir = Join-Path $SourceDir "models"
+$TessdataModelHashes = @{
+    chi_sim = "A5FCB6F0DB1E1D6D8522F39DB4E848F05984669172E584E8D76B6B3141E1F730"
+    eng = "7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2"
+}
 $ReceiptWindowTitle = [string]::Concat([char]0x5FAE, [char]0x4FE1, [char]0x6536, [char]0x6B3E, [char]0x52A9, [char]0x624B)
 
 function Get-Python310 {
     $pythonPath = ""
     $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($launcher) {
-        $pythonPath = & $launcher.Source -3.10 -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1
-        if ($pythonPath) {
-            $pythonPath = $pythonPath.Trim()
+        try {
+            $pythonPath = & $launcher.Source -3.10 -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1
+            if ($pythonPath) {
+                $pythonPath = $pythonPath.Trim()
+            }
+        } catch {
+            $pythonPath = ""
         }
     }
     if ($pythonPath -and (Test-Path -LiteralPath $pythonPath)) {
@@ -29,6 +38,19 @@ function Get-Python310 {
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python310\python.exe"),
         (Join-Path $env:ProgramFiles "Python310\python.exe")
     )
+    foreach ($registryPath in @(
+        "HKCU:\Software\Python\PythonCore\3.10\InstallPath",
+        "HKLM:\Software\Python\PythonCore\3.10\InstallPath",
+        "HKLM:\Software\WOW6432Node\Python\PythonCore\3.10\InstallPath"
+    )) {
+        $registryKey = Get-Item -LiteralPath $registryPath -ErrorAction SilentlyContinue
+        if ($registryKey) {
+            $installPath = $registryKey.GetValue("")
+            if ($installPath) {
+                $candidates += Join-Path $installPath "python.exe"
+            }
+        }
+    }
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath $candidate) {
             return $candidate
@@ -69,23 +91,70 @@ function Find-TesseractInstall {
     return $null
 }
 
+function Test-TesseractLanguages([object]$Tesseract) {
+    $required = @("chi_sim", "eng")
+    foreach ($language in $required) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Tesseract.Tessdata "${language}.traineddata"))) {
+            return $false
+        }
+    }
+    $languages = & $Tesseract.Executable --tessdata-dir $Tesseract.Tessdata --list-langs 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+    foreach ($language in $required) {
+        if ($languages -notcontains $language) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-ModelCandidate([string]$Language) {
+    $candidates = @(
+        (Join-Path $ModelCacheDir "${Language}.traineddata"),
+        (Join-Path $env:USERPROFILE "Downloads\${Language}.traineddata")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Test-TessdataFile([string]$Path, [string]$Language) {
+    if (-not (Test-Path -LiteralPath $Path) -or (Get-Item -LiteralPath $Path).Length -lt 1MB) {
+        return $false
+    }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $TessdataModelHashes[$Language]
+}
+
 function Install-ChineseTessdata([object]$Tesseract) {
     New-Item -ItemType Directory -Force -Path $Tesseract.Tessdata | Out-Null
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     foreach ($language in "chi_sim", "eng") {
         $target = Join-Path $Tesseract.Tessdata "${language}.traineddata"
-        if (Test-Path -LiteralPath $target) {
+        if (Test-TessdataFile $target $language) {
             continue
         }
-        Write-Host "Installing $language OCR language data..."
-        $client = New-Object System.Net.WebClient
-        try {
-            $client.DownloadFile("https://github.com/tesseract-ocr/tessdata_fast/raw/main/${language}.traineddata", $target)
-        } finally {
-            $client.Dispose()
+        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        $candidate = Get-ModelCandidate $language
+        if ($candidate) {
+            Write-Host "Using local $language OCR language data: $candidate"
+            Copy-Item -LiteralPath $candidate -Destination $target -Force
+        } else {
+            Write-Host "Installing $language OCR language data..."
+            $client = New-Object System.Net.WebClient
+            try {
+                $client.DownloadFile("https://github.com/tesseract-ocr/tessdata_fast/raw/main/${language}.traineddata", $target)
+            } finally {
+                $client.Dispose()
+            }
         }
-        if (-not (Test-Path -LiteralPath $target) -or (Get-Item -LiteralPath $target).Length -lt 1MB) {
-            throw "Failed to install Tesseract $language language data."
+        if (-not (Test-TessdataFile $target $language)) {
+            Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+            throw "Tesseract $language language data failed integrity verification."
         }
     }
 }
@@ -187,8 +256,8 @@ $tesseract = [PSCustomObject]@{
     Tessdata = $userTessdata
 }
 Install-ChineseTessdata $tesseract
-if (-not (Test-Path -LiteralPath (Join-Path $tesseract.Tessdata "chi_sim.traineddata")) -or -not (Test-Path -LiteralPath (Join-Path $tesseract.Tessdata "eng.traineddata"))) {
-    throw "Tesseract OCR language data is unavailable."
+if (-not (Test-TesseractLanguages $tesseract)) {
+    throw "Tesseract OCR cannot load the required chi_sim and eng language data."
 }
 
 $configure = -not (Test-Path -LiteralPath $ConfigPath)
