@@ -354,13 +354,44 @@ class CallbackWorker(threading.Thread):
         self.wake.set()
 
     def run(self) -> None:
+        logging.info("callback worker started")
         while not self.stopping.is_set():
-            event = self.store.next_pending()
+            try:
+                event = self.store.next_pending()
+            except Exception:
+                # A transient SQLite/IO error must not permanently stop delivery.
+                logging.exception("callback queue read failed; retrying")
+                self.wake.wait(5)
+                self.wake.clear()
+                continue
             if event is None:
                 self.wake.wait(5)
                 self.wake.clear()
                 continue
-            self.deliver(event)
+            try:
+                self.deliver(event)
+            except Exception as exc:
+                # deliver() handles expected HTTP failures. This catches malformed
+                # persisted payloads and unexpected library errors as retryable too.
+                self.record_failure(event, exc)
+
+    def record_failure(self, event: sqlite3.Row, error: BaseException) -> None:
+        event_id = str(event["event_id"])
+        attempts = int(event["attempts"]) + 1
+        try:
+            self.store.failed(event_id, attempts, self.settings.max_attempts, str(error))
+        except Exception:
+            logging.exception(
+                "callback failure could not be persisted event_id=%s attempt=%d",
+                event_id[:12],
+                attempts,
+            )
+        logging.error(
+            "callback worker recovered from unexpected error event_id=%s attempt=%d",
+            event_id[:12],
+            attempts,
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
     def deliver(self, event: sqlite3.Row) -> None:
         event_id = str(event["event_id"])
@@ -980,6 +1011,10 @@ def main(argv: list[str] | None = None) -> int:
         if not observer.ocr.tesseract_available:
             logging.warning("Tesseract health check failed reason=%s", observer.ocr.tesseract_status)
         while not stopping.wait(settings.poll_interval):
+            if not worker.is_alive():
+                logging.error("callback worker stopped unexpectedly; restarting")
+                worker = CallbackWorker(settings, store, wake)
+                worker.start()
             try:
                 for window_title, raw_text in observer.latest_receipts():
                     for receipt in parse_receipts(window_title, raw_text):

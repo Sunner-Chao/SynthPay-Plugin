@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -222,6 +223,29 @@ class TesseractHealthTest(unittest.TestCase):
 
         self.assertEqual(observer.read_text("微信收款助手", b"image"), "no receipt yet")
         self.assertTrue(observer.tesseract_fallback_logged)
+
+
+class CallbackWorkerTest(unittest.TestCase):
+    def test_unexpected_delivery_error_is_recorded_for_retry(self) -> None:
+        class Store:
+            def __init__(self) -> None:
+                self.failed_call = None
+
+            def failed(self, event_id: str, attempts: int, max_attempts: int, error: str) -> None:
+                self.failed_call = (event_id, attempts, max_attempts, error)
+
+        store = Store()
+        worker = object.__new__(watcher.CallbackWorker)
+        worker.store = store
+        worker.settings = SimpleNamespace(max_attempts=30)
+        event = {"event_id": "a" * 64, "attempts": 0}
+
+        worker.record_failure(event, ValueError("malformed persisted payload"))
+
+        self.assertEqual(
+            store.failed_call,
+            ("a" * 64, 1, 30, "malformed persisted payload"),
+        )
 
 
 @unittest.skipUnless(os.name == "nt", "Windows mutex test")
