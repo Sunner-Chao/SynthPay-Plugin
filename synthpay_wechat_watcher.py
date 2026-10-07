@@ -171,6 +171,31 @@ def parse_receipts(window_title: str, raw_text: str, now: datetime | None = None
                     "receipt_identity": receipt_identity,
                 }
             )
+    # Tesseract sometimes reads the amount label incorrectly on WeChat's dark
+    # receipt card. Require the card's time, result and isolated amount instead.
+    if not receipts and window_title == "微信收款助手" and "收款成功" in normalized:
+        if re.search(r"今日第\d+笔收款", normalized):
+            card = re.search(
+                r"收款到账通知(?P<time>\d{2}月\d{2}日\d{2}:\d{2})(?P<body>.*?)(?:汇总|今日第)",
+                normalized,
+            )
+            amounts = re.findall(r"[￥¥](\d+(?:\.\d{1,2})?)", card.group("body")) if card else []
+            if card and len(amounts) == 1:
+                source_time = card.group("time")
+                money = amounts[0]
+                identity = hashlib.sha256(
+                    "\n".join((window_title, "1", money, f"{captured_at.year}:{source_time}")).encode("utf-8")
+                ).hexdigest()
+                receipts.append(
+                    {
+                        "channel": "1",
+                        "money": money,
+                        "amount_cents": money_to_cents(money),
+                        "observed_at": int(parse_observed_at(source_time, captured_at).timestamp() * 1000),
+                        "raw_digest": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+                        "receipt_identity": identity,
+                    }
+                )
     return receipts
 
 
@@ -425,8 +450,24 @@ class CallbackWorker(threading.Thread):
             logging.info("receipt callback delivered event_id=%s", event_id[:12])
         except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
             attempts = int(event["attempts"]) + 1
-            self.store.failed(event_id, attempts, self.settings.max_attempts, str(exc))
-            logging.warning("receipt callback failed event_id=%s attempt=%d error=%s", event_id[:12], attempts, exc)
+            error_text = str(exc)
+            # An old unmatched receipt cannot be delivered to an expired
+            # order. Keep retrying fresh receipts while orders may be settling.
+            observed_at = int(payload["observed_at"]) / 1000
+            terminal = (
+                "金额通知未匹配到唯一支付单" in error_text
+                and time.time() - observed_at > 600
+            )
+            self.store.failed(
+                event_id,
+                self.settings.max_attempts if terminal else attempts,
+                self.settings.max_attempts,
+                error_text,
+            )
+            if terminal:
+                logging.warning("receipt callback rejected permanently event_id=%s error=%s", event_id[:12], exc)
+            else:
+                logging.warning("receipt callback failed event_id=%s attempt=%d error=%s", event_id[:12], attempts, exc)
 
 
 class WeChatUiObserver:
@@ -591,6 +632,11 @@ def check_tesseract_languages(executable: Path, tessdata_dir: Path) -> tuple[boo
 
 
 class WeChatOcrObserver:
+    # RapidOCR can spend an unbounded amount of time in ONNX runtime on some
+    # machines (especially on its first inference). Keep that optional fast
+    # path from blocking the watcher; Tesseract remains the bounded fallback.
+    RAPIDOCR_TIMEOUT_SECONDS = 15.0
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.last_capture_digest: dict[str, str] = {}
@@ -601,6 +647,11 @@ class WeChatOcrObserver:
         self.restore_logged_handles: set[int] = set()
         self.rapid_ocr: Any | None = None
         self.rapid_ocr_failed = False
+        self.rapid_ocr_thread: threading.Thread | None = None
+        self.rapid_ocr_retry_pending = False
+        self.rapid_ocr_last_attempt = 0.0
+        self.rapid_ocr_retry_interval = 10.0
+        self.last_ocr_error: str | None = None
         self.tesseract_available = False
         self.tesseract_status = "Windows is required"
         self.tesseract_fallback_logged = False
@@ -642,15 +693,31 @@ class WeChatOcrObserver:
             if window_title not in self.capture_armed:
                 if time.monotonic() < self.capture_warmup_until.get(window_title, 0):
                     continue
-                raw = self.read_text(window_title, image)
+                try:
+                    raw = self.read_text(window_title, image)
+                except subprocess.TimeoutExpired:
+                    self.last_ocr_error = "tesseract timeout"
+                    logging.warning("OCR read timed out during warmup window=%s; keeping observer alive", window_title)
+                    continue
                 self.capture_armed.add(window_title)
                 logging.info("OCR observer armed window=%s", window_title)
                 if raw:
                     yield window_title, raw
                 continue
-            if previous_digest == digest:
+            retry_ready = (
+                self.rapid_ocr_retry_pending
+                and self.rapid_ocr_thread is not None
+                and not self.rapid_ocr_thread.is_alive()
+                and time.monotonic() - self.rapid_ocr_last_attempt >= self.rapid_ocr_retry_interval
+            )
+            if previous_digest == digest and not retry_ready:
                 continue
-            raw = self.read_text(window_title, image)
+            try:
+                raw = self.read_text(window_title, image)
+            except subprocess.TimeoutExpired:
+                self.last_ocr_error = "tesseract timeout"
+                logging.warning("OCR read timed out window=%s; keeping observer alive", window_title)
+                continue
             if raw:
                 yield window_title, raw
 
@@ -861,19 +928,64 @@ class WeChatOcrObserver:
     def read_rapid_text(self, image: bytes) -> str:
         if self.rapid_ocr_failed:
             return ""
-        try:
-            if self.rapid_ocr is None:
-                from rapidocr_onnxruntime import RapidOCR
-
-                self.rapid_ocr = RapidOCR()
-            result, _elapsed = self.rapid_ocr(image)
-            return "\n".join(str(item[1]) for item in (result or [])).strip()
-        except Exception as exc:
-            self.rapid_ocr_failed = True
-            logging.warning("RapidOCR unavailable, using Tesseract fallback error=%s", str(exc)[:300])
+        if self.rapid_ocr_thread is not None and self.rapid_ocr_thread.is_alive():
             return ""
+        self.rapid_ocr_last_attempt = time.monotonic()
+        self.rapid_ocr_retry_pending = False
+        result_holder: dict[str, Any] = {}
+        completed = threading.Event()
+
+        def run_rapidocr() -> None:
+            try:
+                if self.rapid_ocr is None:
+                    import cv2
+                    from rapidocr_onnxruntime import RapidOCR
+
+                    cv2.setNumThreads(2)
+                    self.rapid_ocr = RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1)
+                result, _elapsed = self.rapid_ocr(image)
+                result_holder["text"] = "\n".join(str(item[1]) for item in (result or [])).strip()
+            except Exception as exc:
+                result_holder["error"] = exc
+            finally:
+                completed.set()
+
+        # Use a daemon thread because ONNX runtime does not expose a reliable
+        # cancellation API. A slow call is abandoned and Tesseract takes over.
+        self.rapid_ocr_thread = threading.Thread(target=run_rapidocr, name="rapidocr", daemon=True)
+        self.rapid_ocr_thread.start()
+        if not completed.wait(self.RAPIDOCR_TIMEOUT_SECONDS):
+            self.rapid_ocr_retry_pending = True
+            self.last_ocr_error = "rapidocr timeout"
+            logging.warning(
+                "RapidOCR timed out after %.1fs, using Tesseract until inference recovers",
+                self.RAPIDOCR_TIMEOUT_SECONDS,
+            )
+            return ""
+        error = result_holder.get("error")
+        if error is not None:
+            self.rapid_ocr_failed = True
+            self.last_ocr_error = f"rapidocr error: {error}"
+            logging.warning("RapidOCR unavailable, using Tesseract fallback error=%s", str(error)[:300])
+            return ""
+        return str(result_holder.get("text", ""))
 
     def read_tesseract_text(self, image: bytes) -> str:
+        page_mode = "6"
+        try:
+            import cv2
+            import numpy as np
+
+            bitmap = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if bitmap is not None and bitmap.mean() < 100:
+                light_text = cv2.threshold(bitmap, 140, 255, cv2.THRESH_BINARY_INV)[1]
+                enhanced = cv2.resize(light_text, None, fx=2, fy=2)
+                encoded, buffer = cv2.imencode(".png", enhanced)
+                if encoded:
+                    image = buffer.tobytes()
+                    page_mode = "11"
+        except Exception as exc:
+            logging.warning("Tesseract image preprocessing unavailable: %s", str(exc)[:200])
         command = [
             str(self.settings.tesseract_path),
             "stdin",
@@ -883,7 +995,7 @@ class WeChatOcrObserver:
             "-l",
             "chi_sim+eng",
             "--psm",
-            "6",
+            page_mode,
         ]
         completed = subprocess.run(
             command,
@@ -897,6 +1009,7 @@ class WeChatOcrObserver:
         if completed.returncode != 0:
             error = completed.stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"Tesseract failed: {error[:300]}")
+        self.last_ocr_error = None
         return completed.stdout.decode("utf-8", errors="replace").strip()
 
 
