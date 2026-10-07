@@ -1,4 +1,14 @@
 # SynthPay Windows WeChat Receipt Watcher
++
+
+## 项目事实速览
+
+Windows 微信收款通知 UI Automation + RapidOCR 监听辅助。
+
+**运行与开发**：Windows、Python 3.10+；安装 `requirements.txt` 后运行 `synthpay_wechat_watcher.py`。
+
+**边界与安全**：模型、第三方 API、支付渠道、桌面自动化、OCR 和外部数据源均受其自身授权、限额和兼容性约束；不要把演示数据或测试通过当作生产 SLA。禁止提交密钥、令牌、个人数据、模型文件和生产日志。许可证以仓库 LICENSE/NOTICE 及第三方组件声明为准。
+
 
 该研究型插件读取 Windows 微信中独立打开的收款通知窗口，并通过 SynthPay v2 签名协议回调。微信 3.x 使用 UI Automation；微信 4.x 使用 Win32 `PrintWindow` 后台窗口截图、RapidOCR 主识别和 Tesseract 金额复核。
 
