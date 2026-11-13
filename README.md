@@ -1,14 +1,4 @@
 # SynthPay Windows WeChat Receipt Watcher
-+
-
-## 项目事实速览
-
-Windows 微信收款通知 UI Automation + RapidOCR 监听辅助。
-
-**运行与开发**：Windows、Python 3.10+；安装 `requirements.txt` 后运行 `synthpay_wechat_watcher.py`。
-
-**边界与安全**：模型、第三方 API、支付渠道、桌面自动化、OCR 和外部数据源均受其自身授权、限额和兼容性约束；不要把演示数据或测试通过当作生产 SLA。禁止提交密钥、令牌、个人数据、模型文件和生产日志。许可证以仓库 LICENSE/NOTICE 及第三方组件声明为准。
-
 
 该研究型插件读取 Windows 微信中独立打开的收款通知窗口，并通过 SynthPay v2 签名协议回调。微信 3.x 使用 UI Automation；微信 4.x 使用 Win32 `PrintWindow` 后台窗口截图、RapidOCR 主识别和 Tesseract 金额复核。
 
@@ -24,7 +14,7 @@ Windows 微信收款通知 UI Automation + RapidOCR 监听辅助。
 - 可验证回调：HMAC-SHA256 v2 覆盖发送时间、消息内容、事件 ID 与观察时间。
 - 隐私最小化：日志不保存微信通知原文；真实回调密钥仅保存在本机受 ACL 保护的配置文件中。
 
-该项目是收款通知研究与集成样例。使用者应确保自身场景符合微信、支付服务及当地法律法规的适用要求。
+该项目是收款通知研究与集成样例。使用者应确保自身场景符合微信、支付服务及当地法律法规的适用要求。完整项目的共享事件/结算约定见 [SynthPay payment guide](https://github.com/Sunner-Chao/SynthPay/blob/main/docs/payments/README.md)。
 
 ## 要求
 
@@ -48,13 +38,13 @@ OCR 模型下载后会进行固定 SHA-256 校验，并通过 `tesseract --list-
 .\setup-and-start.ps1
 ```
 
-无界面部署可传入回调配置：
+仅执行不投递事件的安装检查：
 
 ```powershell
-.\setup-and-start.ps1 -NonInteractive -CallbackUrl "https://example.com/api/pay/1/notify" -CallbackSecret "your-secret"
+.\setup-and-start.ps1 -NonInteractive -DryRun
 ```
 
-脚本只写入当前 Windows 用户的 `%APPDATA%\SynthPay\wechat-watcher.ini`，不会将密钥提交进仓库。若配置已经存在，会保留它。
+首次生产配置请交互式运行 `setup-and-start.ps1`，回调密钥会在提示时输入并只写入当前 Windows 用户的 `%APPDATA%\SynthPay\wechat-watcher.ini`。不要把真实密钥作为 PowerShell 参数传入，因为命令历史和进程参数可能暴露它。已有配置会保留。
 
 若 Tesseract 升级或模型文件损坏，可运行：
 

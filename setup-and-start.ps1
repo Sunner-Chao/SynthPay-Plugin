@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
     [string]$CallbackUrl,
-    [string]$CallbackSecret,
     [switch]$DryRun,
     [switch]$NonInteractive
 )
@@ -262,7 +261,7 @@ if (-not (Test-TesseractLanguages $tesseract)) {
 }
 
 $configure = -not (Test-Path -LiteralPath $ConfigPath)
-if ($PSBoundParameters.ContainsKey("CallbackUrl") -or $PSBoundParameters.ContainsKey("CallbackSecret") -or $DryRun) {
+if ($PSBoundParameters.ContainsKey("CallbackUrl") -or $DryRun) {
     $configure = $true
 }
 if (-not $configure -and -not (Test-ExistingConfiguration)) {
@@ -271,26 +270,38 @@ if (-not $configure -and -not (Test-ExistingConfiguration)) {
 }
 
 if ($configure) {
-    if (-not $DryRun -and ([string]::IsNullOrWhiteSpace($CallbackUrl) -or [string]::IsNullOrWhiteSpace($CallbackSecret))) {
+    if (-not $DryRun -and [string]::IsNullOrWhiteSpace($CallbackUrl)) {
         if ($NonInteractive) {
-            throw "Production setup requires -CallbackUrl and -CallbackSecret. Use -DryRun for an offline installation check."
+            throw "Non-interactive setup requires an existing protected production configuration. Use -DryRun for an installation check."
         }
         Write-Host "No local SynthPay configuration exists."
         $CallbackUrl = Read-Host "SynthPay HTTPS callback URL (press Enter for dry-run mode)"
         if ([string]::IsNullOrWhiteSpace($CallbackUrl)) {
             $DryRun = $true
-        } else {
-            $CallbackSecret = Read-Host "SynthPay callback secret"
-            if ([string]::IsNullOrWhiteSpace($CallbackSecret)) {
-                throw "A callback secret is required for production mode."
-            }
         }
     }
     if ($DryRun) {
         $CallbackUrl = ""
         $CallbackSecret = ""
-    } elseif ($CallbackUrl -notmatch "^https://") {
-        throw "Production callback URL must use HTTPS."
+    } else {
+        if ($CallbackUrl -notmatch "^https://") {
+            throw "Production callback URL must use HTTPS."
+        }
+        if ([string]::IsNullOrWhiteSpace($CallbackSecret)) {
+            if ($NonInteractive) {
+                throw "Non-interactive setup cannot prompt for a production secret. Use an existing protected configuration or run interactively."
+            }
+            $SecureSecret = Read-Host "SynthPay callback secret" -AsSecureString
+            $SecretPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureSecret)
+            try {
+                $CallbackSecret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($SecretPointer)
+            } finally {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($SecretPointer)
+            }
+            if ([string]::IsNullOrWhiteSpace($CallbackSecret)) {
+                throw "A callback secret is required for production mode."
+            }
+        }
     }
     Write-Configuration -Url $CallbackUrl -Secret $CallbackSecret -UseDryRun ([bool]$DryRun) -Tesseract $tesseract
 } else {
